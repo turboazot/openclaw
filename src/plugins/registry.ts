@@ -9,6 +9,7 @@ import type {
 } from "../gateway/server-methods/types.js";
 import { registerInternalHook } from "../hooks/internal-hooks.js";
 import type { HookEntry } from "../hooks/types.js";
+import { onAgentEvent, type AgentEventPayload } from "../infra/agent-events.js";
 import { resolveUserPath } from "../utils.js";
 import { registerPluginCommand } from "./commands.js";
 import { normalizePluginHttpPath } from "./http-path.js";
@@ -124,6 +125,7 @@ export type PluginRecord = {
   configSchema: boolean;
   configUiHints?: Record<string, PluginConfigUiHint>;
   configJsonSchema?: Record<string, unknown>;
+  cleanupFns?: Array<() => void>;
 };
 
 export type PluginRegistry = {
@@ -580,6 +582,47 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
       hookPolicy?: PluginTypedHookPolicy;
     },
   ): OpenClawPluginApi => {
+    const registerCleanup = (cleanup: () => void) => {
+      if (!record.cleanupFns) {
+        record.cleanupFns = [];
+        registry.typedHooks.push({
+          pluginId: record.id,
+          hookName: "gateway_stop",
+          handler: () => {
+            const cleanups = record.cleanupFns?.splice(0) ?? [];
+            for (const fn of cleanups) {
+              try {
+                fn();
+              } catch {
+                // ignore cleanup errors during shutdown
+              }
+            }
+          },
+          source: record.source,
+        });
+      }
+      record.cleanupFns.push(cleanup);
+    };
+
+    const matchesAgentEvent = (
+      event: AgentEventPayload,
+      filters?: {
+        runId?: string;
+        sessionKey?: string;
+      },
+    ): boolean => {
+      if (!filters) {
+        return true;
+      }
+      if (filters.runId && event.runId !== filters.runId) {
+        return false;
+      }
+      if (filters.sessionKey && event.sessionKey !== filters.sessionKey) {
+        return false;
+      }
+      return true;
+    };
+
     return {
       id: record.id,
       name: record.name,
@@ -602,6 +645,26 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
       registerCommand: (command) => registerCommand(record, command),
       registerContextEngine: (id, factory) => registerContextEngine(id, factory),
       resolvePath: (input: string) => resolveUserPath(input),
+      onAgentEvent: (listener, opts) => {
+        const unsubscribe = onAgentEvent((event) => {
+          if (!matchesAgentEvent(event, opts)) {
+            return;
+          }
+          listener(event);
+        });
+        registerCleanup(unsubscribe);
+        return () => {
+          unsubscribe();
+          const cleanups = record.cleanupFns;
+          if (!cleanups) {
+            return;
+          }
+          const index = cleanups.indexOf(unsubscribe);
+          if (index >= 0) {
+            cleanups.splice(index, 1);
+          }
+        };
+      },
       on: (hookName, handler, opts) =>
         registerTypedHook(record, hookName, handler, opts, params.hookPolicy),
     };
